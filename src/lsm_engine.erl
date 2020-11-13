@@ -87,9 +87,12 @@ init([Table, TableName]) ->
     disk_log:open([{name, CPath}, {file, CPath}]),
     OpIds = lists:foldl(fun
                             ({OpId, {put, Record}} ,Acc) ->
-                                true = ets:insert(Tab, Record);
-                            ({OdId, {delete, Key}}, Acc) ->
-                                true = 
+                                true = ets:insert(Tab, Record),
+                                [{TableName, OpId} | Acc];
+                            ({OpId, {delete, Key}}, Acc) ->
+                                true = ets:insert(Tab, {Key, deleted}),
+                                [{TableName, OpId} | Acc]
+                         end, [], RecOps),
     {ok, #lsm_engine_state{
             table = Tab,
             name = TableName,
@@ -98,7 +101,9 @@ init([Table, TableName]) ->
             info = TableInfo,
             max_ram_size = MaxRam,
             max_file_size = MaxFile,
-            operations = []}
+            operations = OpIds,
+            journal_finished = FPath,
+            journal_current = CPath}
     }.
 
 handle_call(Operation = {put, Record}, _From, State = #lsm_engine_state{
