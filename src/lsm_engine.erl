@@ -31,7 +31,9 @@
                            max_file_size,
                            operations,
                            journal_current,
-                           journal_finished
+                           journal_finished,
+                           size,
+                           ranges
                           }).
 
 %%%===================================================================
@@ -56,15 +58,22 @@ table_delete(TableName) ->
         Error -> Error
     end.
 
-%% TODO need protection from noproc error
-put(TableName, Record = {_Key, _Value}) ->
-    gen_server:call(?TABLE(TableName), {put, Record});
-put(_, Record) ->
-    {error, {bad_record, Record}}.
-get() -> ok.
-delete() -> ok.
+put(TableName, Record) when is_tuple(Record) ->
+    ?MODULE:put(TableName, [Record]);
+put(TableName, RecordList) ->
+    case catch gen_server:call(?TABLE(TableName), {put, RecordList}) of
+        {ok, OpId} -> {ok, OpId};
+        {error, Error} -> {error, Error};
+        Other -> {error, Other}
+    end.
+%get() -> ok.
+%delete() -> ok.
 
-set_journals(TableName, {LogFinished, LogCurrent}) -> ok.
+set_journals(TableName, {LogFinished, LogCurrent}) ->
+    case catch gen_server:call(?TABLE(TableName), {set_journals, LogFinished, LogCurrent}) of
+        ok -> ok;
+        _Other -> ok
+    end.
 
 %%%===================================================================
 %%% Spawning and gen_server implementation
@@ -74,52 +83,56 @@ start_link(TableName) ->
     Table = ?TABLE(TableName),
     gen_server:start_link({local, Table}, ?MODULE, [Table, TableName], []).
 
-init([Table, TableName]) ->
+init([_Table, TableName]) ->
     DbDir = lsm_engine_common:get_db_directory(),
     MaxRam = get_max_ram(),
     MaxFile = get_max_file(),
     TableDir = filename:join(DbDir, TableName),
-    TableInfo = read_t_info(TableName, TableDir), %% TODO this unsafe
-    TableType = maps:get(t_type, TableInfo, disk),
-    Tab = ets:new(Table, [ordered_set, private]),
+    TableInfo = open_t_info(TableName, TableDir),
+    {TableType, Ranges} = read_t_info(TableInfo),
+    Tab = new_mem_table(),
     {FPath, CPath, RecOps} = lsm_engine_journal:get_init_cfg(TableName),
-    disk_log:open([{name, FPath}, {file, FPath}]),
-    disk_log:open([{name, CPath}, {file, CPath}]),
-    OpIds = lists:foldl(fun
-                            ({OpId, {put, Record}} ,Acc) ->
-                                true = ets:insert(Tab, Record),
-                                [{TableName, OpId} | Acc];
-                            ({OpId, {delete, Key}}, Acc) ->
-                                true = ets:insert(Tab, {Key, deleted}),
-                                [{TableName, OpId} | Acc]
-                         end, [], RecOps),
-    {ok, #lsm_engine_state{
-            table = Tab,
-            name = TableName,
-            type = TableType,
-            dir = TableDir,
-            info = TableInfo,
-            max_ram_size = MaxRam,
-            max_file_size = MaxFile,
-            operations = OpIds,
-            journal_finished = FPath,
-            journal_current = CPath}
-    }.
+    {ok, FPath} = disk_log:open([{name, FPath}, {file, FPath}]),
+    {ok, CPath} = disk_log:open([{name, CPath}, {file, CPath}]),
+    {OpIds, Size} = lists:foldl(fun
+                                    ({OpId, {put, Record}} , {Ops, Sz}) ->
+                                       true = ets:insert(Tab, Record),
+                                       { [{TableName, OpId} | Ops], Sz + erlang:size(term_to_binary(Record)) };
+                                    ({OpId, {delete, Key}}, {Ops, Sz}) ->
+                                       true = ets:insert(Tab, {Key, deleted}),
+                                       { [{TableName, OpId} | Ops], Sz }
+                               end, {[], 0}, RecOps),
+    State = #lsm_engine_state{
+        table = Tab,
+        name = TableName,
+        type = TableType,
+        dir = TableDir,
+        info = TableInfo,
+        max_ram_size = MaxRam,
+        max_file_size = MaxFile,
+        operations = OpIds,
+        journal_finished = FPath,
+        journal_current = CPath,
+        size = Size,
+        ranges = Ranges},
+    {ok, State}.
 
-handle_call(Operation = {put, Record}, _From, State = #lsm_engine_state{
-                                                         table = Tab,
-                                                         name = TableName,
-                                                         type = TableType,
-                                                         dir = TableDir,
-                                                         max_ram_size = MaxRam,
-                                                         info = TableInfo,
-                                                         operations = Ops}) ->
+handle_call(_Operation = {put, Records}, _From, State) ->
 
-    Result0 = registering(Operation),
+    {Result, NewState} = case catch do_put(check_records, Records, State) of
+                             {{ok, OpId}, NewSt} -> {{ok, OpId}, NewSt};
+                             {error,Other} -> {{error, Other}, State};
+                             Other -> {{error, Other}, State}
+                         end,
 
-
-    {reply, ok, State};
-
+    {reply, Result, NewState};
+handle_call({set_journals, LogFinished, LogCurrent}, _From, State =
+    #lsm_engine_state{journal_finished = FLog, journal_current = CLog}) ->
+    disk_log:close(FLog),
+    disk_log:close(CLog),
+    disk_log:open([{name, LogFinished},{file, LogFinished}]),
+    disk_log:open([{name, LogCurrent},{file, LogCurrent}]),
+    {reply, ok, State#lsm_engine_state{journal_current = LogCurrent, journal_finished = LogFinished}};
 handle_call(_Request, _From, State = #lsm_engine_state{}) ->
     {reply, ok, State}.
 
@@ -141,15 +154,29 @@ code_change(_OldVsn, State = #lsm_engine_state{}, _Extra) ->
 
 
 get_max_ram() ->
-    application:get_env(max_ram_table, ?DEFAULT_MAX_RAM_TABLE).
+    application:get_env(lsm_engine, max_ram_table, ?DEFAULT_MAX_RAM_TABLE).
 get_max_file() ->
-    application:get_env(max_file_segment, ?DEFAULT_MAX_FILE_SEGMENT).
-read_t_info(TableName, TableDir) ->
+    application:get_env(lsm_engine, max_file_segment, ?DEFAULT_MAX_FILE_SEGMENT).
+open_t_info(TableName, TableDir) ->
     File = filename:join(TableDir, ?INFO_FILE),
     {ok, Name} = dets:open_file(TableName, [{file, File}]),
-    dets:foldl(fun({Key, Value}, Acc) -> Acc#{Key => Value} end, #{}, Name).
+    Name.
+read_t_info(InfoFile) ->
+    TType = case dets:lookup(InfoFile, t_type) of
+                [{t_type, TRes}] -> TRes;
+                [] -> dets:insert(InfoFile, {t_type, disk})
+            end,
+    Ranges = case dets:lookup(InfoFile, ranges) of
+                 [{ranges, RRes}] -> RRes;
+                 [] ->
+                     dets:insert(InfoFile, {ranges, #{}}),
+                     #{}
+             end,
+    {TType, Ranges}.
+update_t_info(InfoFile, Key, Value) ->
+    dets:insert(InfoFile, {Key, Value}).
 
-internal_table_create(TableName, TableType) ->
+internal_table_create(TableName, TableType) when TableType =:= disk orelse TableType =:= ram ->
     DbDir = lsm_engine_common:get_db_directory(),
     TableDir = filename:join(DbDir, TableName),
     InfoFile = filename:join(TableDir, ?INFO_FILE),
@@ -167,13 +194,66 @@ internal_table_create(TableName, TableType) ->
                     {error, Err}
             end;
         Error -> Error
-    end.
+    end;
+internal_table_create(_TableName, TableType) -> {error, {bad_table_type, TableType}}.
 
 internal_table_delete(TableName) ->
     DbDir = lsm_engine_common:get_db_directory(),
     TableDir = filename:join(DbDir, TableName),
-    ListFiles = file:list_dir(TableDir),
+    ListFiles = case file:list_dir(TableDir) of
+                          {ok, List} -> List;
+                          {error, _Reason} ->
+                              %%io:format("cant read list files from dir ~p with reason ~p~n", [TableDir, Reason]),
+                              []
+                      end,
     lists:foreach(fun(File) ->
                           file:delete(filename:join([TableDir, File]))
                   end, ListFiles),
     file:del_dir(TableDir).
+
+do_put(check_records, Records, State) ->
+    case lists:filter(fun(Rec) -> not (is_tuple(Rec) andalso erlang:size(Rec) =:= 2) end, Records) of
+        [] -> do_put(insert, Records, State);
+        BadRecords -> throw({bad_records,BadRecords})
+    end;
+do_put(insert, Records, State = #lsm_engine_state{
+                                   table = Tab,
+                                   name = TableName,
+                                   operations = Ops,
+                                   journal_current = CLog,
+                                   size = TSize}) ->
+    OpId = {TableName, make_ref()},
+    ok = disk_log:log_terms(CLog, [{OpId, {put, Records}}]),
+    ok = disk_log:sync(CLog),
+    true = ets:insert(Tab, Records),
+    do_put(dump_file, OpId, State#lsm_engine_state{operations = [OpId | Ops],
+                                                                     size = TSize + erlang:size(term_to_binary(Records))});
+do_put(dump_file, OpId, State = #lsm_engine_state{
+                                        table = Tab,
+                                        type = TableType,
+                                        dir = TableDir,
+                                        max_ram_size = MaxRam,
+                                        info = TableInfo,
+                                        operations = Ops,
+                                        journal_finished = FLog,
+                                        size = TSize,
+                                        ranges = Ranges}) when TSize >= MaxRam andalso TableType =:= disk ->
+    %io:format("dumping table~n"),
+    File = filename:join([TableDir, new_file("unmerge_")]),
+    ok = ets:tab2file(Tab, File),
+    ok = disk_log:log_terms(FLog, Ops),
+    Range = {ets:first(Tab), ets:last(Tab)},
+    NewRanges = Ranges#{Range => File},
+    update_t_info(TableInfo, ranges, NewRanges),
+    ets:delete(Tab),
+    NewTab = new_mem_table(),
+    {{ok, OpId}, State#lsm_engine_state{table = NewTab, operations = [], size = 0, ranges = NewRanges}};
+do_put(dump_file, OpId, State) ->
+    {{ok, OpId}, State}.
+
+
+new_file(Pattern) ->
+    lists:flatten([Pattern, erlang:integer_to_list(erlang:monotonic_time())]).
+
+new_mem_table() ->
+    ets:new(memTable, [ordered_set, private]).

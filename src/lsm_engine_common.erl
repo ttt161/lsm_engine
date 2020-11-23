@@ -16,4 +16,4 @@
 ]).
 
 get_db_directory() ->
-    application:get_env(db_dir, ?DEFAULT_DB_DIR).
+    application:get_env(lsm_engine, db_dir, ?DEFAULT_DB_DIR).
